@@ -15,93 +15,70 @@
 */
 
 #include <stdlib.h>
-#include <sys/stat.h>
+#include <stdio.h>
 #include <limits.h>
-#include <cutils/log.h>
-
-#include <sqlite3.h>
 
 #include "su.h"
 
-static sqlite3 *db_init(void)
+int database_check(struct su_context *ctx)
 {
-    sqlite3 *db;
-    int rc;
-
-    rc = sqlite3_open_v2(REQUESTOR_DATABASE_PATH, &db, SQLITE_OPEN_READONLY, NULL);
-    if ( rc ) {
-        LOGE("Couldn't open database: %s", sqlite3_errmsg(db));
-        return NULL;
-    }
-
-    // Create an automatic busy handler in case the db is locked
-    sqlite3_busy_timeout(db, 1000);
-    return db;
-}
-
-static int db_check(sqlite3 *db, const struct su_context *ctx)
-{
-    char sql[4096];
-    char *zErrmsg;
-    char **result;
-    int nrow,ncol;
-    int allow = DB_INTERACTIVE;
-
-    sqlite3_snprintf(
-        sizeof(sql), sql,
-        "SELECT _id,name,allow FROM apps WHERE uid=%u AND exec_uid=%u AND exec_cmd='%q';",
-        ctx->from.uid, ctx->to.uid, get_command(&ctx->to)
-    );
-
-    if (strlen(sql) >= sizeof(sql)-1)
-        return DB_DENY;
-        
-    int error = sqlite3_get_table(db, sql, &result, &nrow, &ncol, &zErrmsg);
-    if (error != SQLITE_OK) {
-        LOGE("Database check failed with error message %s", zErrmsg);
-        if (error == SQLITE_BUSY) {
-            LOGE("Specifically, the database is busy");
-        }
-        return DB_DENY;
-    }
+    FILE *fp;
+    char filename[PATH_MAX];
+    char allow[7];
+    int last = 0;
+    int from_uid = ctx->from.uid;
     
-    if (nrow == 0 || ncol != 3)
-        goto out;
+    if (ctx->user.owner_mode) {
+        from_uid = from_uid % 100000;
+    }
+
+    snprintf(filename, sizeof(filename),
+                "%s/%u-%u", ctx->user.store_path, from_uid, ctx->to.uid);
+    if ((fp = fopen(filename, "r"))) {
+        LOGD("Found file %s", filename);
         
-    if (strcmp(result[0], "_id") == 0 && strcmp(result[2], "allow") == 0) {
-        if (strcmp(result[5], "1") == 0) {
-            allow = DB_ALLOW;
-        } else if (strcmp(result[5], "-1") == 0){
-            allow = DB_INTERACTIVE;
+        while (fgets(allow, sizeof(allow), fp)) {
+            last = strlen(allow) - 1;
+            if (last >= 0)
+        	    allow[last] = 0;
+        	
+            char cmd[ARG_MAX];
+            fgets(cmd, sizeof(cmd), fp);
+            /* skip trailing '\n' */
+            last = strlen(cmd) - 1;
+            if (last >= 0)
+                cmd[last] = 0;
+
+            LOGD("Comparing '%s' to '%s'", cmd, get_command(&ctx->to));
+            if (strcmp(cmd, get_command(&ctx->to)) == 0)
+                break;
+            else if (strcmp(cmd, "any") == 0) {
+                ctx->to.all = 1;
+                break;
+            }
+            else
+                strcpy(allow, "prompt");
+        }
+        fclose(fp);
+    } else if ((fp = fopen(ctx->user.store_default, "r"))) {
+        LOGD("Using default file %s", ctx->user.store_default);
+        fgets(allow, sizeof(allow), fp);
+        last = strlen(allow) - 1;
+        if (last >=0)
+            allow[last] = 0;
+        
+        fclose(fp);
+    }
+
+    if (strcmp(allow, "allow") == 0) {
+        return ALLOW;
+    } else if (strcmp(allow, "deny") == 0) {
+        return DENY;
+    } else {
+        if (ctx->user.userid != 0 && ctx->user.owner_mode) {
+            return DENY;
         } else {
-            allow = DB_DENY;
+            return INTERACTIVE;
         }
     }
-
-out:
-    sqlite3_free_table(result);
-    
-    return allow;
-}
-
-int database_check(const struct su_context *ctx)
-{
-    sqlite3 *db;
-    int dballow;
-
-    LOGE("sudb - Opening database");
-    db = db_init();
-    if (!db) {
-        LOGE("sudb - Could not open database, prompt user");
-        // if the database could not be opened, we can assume we need to
-        // prompt the user
-        return DB_INTERACTIVE;
-    }
-
-    LOGE("sudb - Database opened");
-    dballow = db_check(db, ctx);
-    // Close the database, we're done with it. If it stays open, it will cause problems
-    sqlite3_close(db);
-    LOGE("sudb - Database closed");
-    return dballow;
 }

@@ -24,23 +24,17 @@
 #include <unistd.h>
 #include <limits.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <getopt.h>
 #include <stdint.h>
 #include <pwd.h>
 
 #include <private/android_filesystem_config.h>
 #include <cutils/properties.h>
-#include <cutils/log.h>
 
 #include "su.h"
-
-/* Still lazt, will fix this */
-static char socket_path[PATH_MAX];
+#include "utils.h"
 
 static int from_init(struct su_initiator *from)
 {
@@ -107,6 +101,35 @@ static int from_init(struct su_initiator *from)
     return 0;
 }
 
+static void read_options(struct su_context *ctx)
+{
+    char mode[12];
+    FILE *fp;
+    if ((fp = fopen(REQUESTOR_OPTIONS, "r"))) {
+        fgets(mode, sizeof(mode), fp);
+        if (strcmp(mode, "user\n") == 0) {
+            ctx->user.owner_mode = 0;
+        } else if (strcmp(mode, "owner\n") == 0) {
+            ctx->user.owner_mode = 1;
+        }
+    }
+}
+
+static void user_init(struct su_context *ctx)
+{
+    if (ctx->from.uid > 99999) {
+    	ctx->user.userid = ctx->from.uid / 100000;
+    	if (!ctx->user.owner_mode) {
+        	snprintf(ctx->user.data_path, PATH_MAX, "/data/user/%d/%s",
+        	        ctx->user.userid, REQUESTOR);
+    	    snprintf(ctx->user.store_path, PATH_MAX, "/data/user/%d/%s/files/stored",
+    	            ctx->user.userid, REQUESTOR);
+        	snprintf(ctx->user.store_default, PATH_MAX, "/data/user/%d/%s/files/stored/default",
+        	        ctx->user.userid, REQUESTOR);
+    	}
+    }
+}
+
 static void populate_environment(const struct su_context *ctx)
 {
     struct passwd *pw;
@@ -125,20 +148,83 @@ static void populate_environment(const struct su_context *ctx)
     }
 }
 
-static void socket_cleanup(void)
+void set_identity(unsigned int uid)
 {
-    unlink(socket_path);
+    /*
+     * Set effective uid back to root, otherwise setres[ug]id will fail
+     * if uid isn't root.
+     */
+    if (seteuid(0)) {
+        PLOGE("seteuid (root)");
+        exit(EXIT_FAILURE);
+    }
+    if (setresgid(uid, uid, uid)) {
+        PLOGE("setresgid (%u)", uid);
+        exit(EXIT_FAILURE);
+    }
+    if (setresuid(uid, uid, uid)) {
+        PLOGE("setresuid (%u)", uid);
+        exit(EXIT_FAILURE);
+    }
 }
+
+static void socket_cleanup(struct su_context *ctx)
+{
+    if (ctx && ctx->sock_path[0]) {
+        if (unlink(ctx->sock_path))
+            PLOGE("unlink (%s)", ctx->sock_path);
+        ctx->sock_path[0] = 0;
+    }
+}
+
+static void child_cleanup(struct su_context *ctx)
+{
+    pid_t pid = ctx->child;
+    int rc;
+
+    if (!pid) {
+        LOGE("unexpected child");
+        pid = -1;	/* pick up any child */
+    }
+    pid = waitpid(pid, &rc, WNOHANG);
+    if (pid < 0) {
+        PLOGE("waitpid");
+        exit(EXIT_FAILURE);
+    }
+    if (WIFEXITED(rc) && WEXITSTATUS(rc)) {
+        LOGE("child %d terminated with error %d", pid, WEXITSTATUS(rc));
+        exit(EXIT_FAILURE);
+    }
+    if (WIFSIGNALED(rc) && WTERMSIG(rc) != SIGKILL) {
+        LOGE("child %d terminated with signal %d", pid, WTERMSIG(rc));
+        exit(EXIT_FAILURE);
+    }
+    LOGD("child %d terminated, status %d", pid, rc);
+    ctx->child = 0;
+}
+
+/*
+ * For use in signal handlers/atexit-function
+ * NOTE: su_ctx points to main's local variable.
+ *       It's OK due to the program uses exit(3), not return from main()
+ */
+static struct su_context *su_ctx = NULL;
 
 static void cleanup(void)
 {
-    socket_cleanup();
+    socket_cleanup(su_ctx);
 }
 
 static void cleanup_signal(int sig)
 {
-    socket_cleanup();
+    socket_cleanup(su_ctx);
     exit(128 + sig);
+}
+
+void sigchld_handler(int sig)
+{
+    child_cleanup(su_ctx);
+    (void)sig;
 }
 
 static int socket_create_temp(char *path, size_t len)
@@ -150,6 +236,10 @@ static int socket_create_temp(char *path, size_t len)
     if (fd < 0) {
         PLOGE("socket");
         return -1;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC)) {
+        PLOGE("fcntl FD_CLOEXEC");
+        goto err;
     }
 
     memset(&sun, 0, sizeof(sun));
@@ -184,14 +274,17 @@ static int socket_accept(int serv_fd)
 {
     struct timeval tv;
     fd_set fds;
-    int fd;
+    int fd, rc;
 
     /* Wait 20 seconds for a connection, then give up. */
     tv.tv_sec = 20;
     tv.tv_usec = 0;
     FD_ZERO(&fds);
     FD_SET(serv_fd, &fds);
-    if (select(serv_fd + 1, &fds, NULL, NULL, &tv) < 1) {
+    do {
+        rc = select(serv_fd + 1, &fds, NULL, NULL, &tv);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 1) {
         PLOGE("select");
         return -1;
     }
@@ -278,23 +371,29 @@ static void usage(int status)
     exit(status);
 }
 
-static void deny(const struct su_context *ctx)
+static __attribute__ ((noreturn)) void deny(struct su_context *ctx)
 {
     char *cmd = get_command(&ctx->to);
 
-    send_intent(ctx, "", 0, ACTION_RESULT);
+    // No send to UI denied requests for shell and root users (they are in the log)
+    if( ctx->from.uid != AID_SHELL && ctx->from.uid != AID_ROOT ) {
+        send_intent(ctx, DENY, ACTION_RESULT);
+    }
     LOGW("request rejected (%u->%u %s)", ctx->from.uid, ctx->to.uid, cmd);
     fprintf(stderr, "%s\n", strerror(EACCES));
     exit(EXIT_FAILURE);
 }
 
-static void allow(const struct su_context *ctx)
+static __attribute__ ((noreturn)) void allow(struct su_context *ctx)
 {
     char *arg0;
     int argc, err;
 
     umask(ctx->umask);
-    send_intent(ctx, "", 1, ACTION_RESULT);
+    // No send to UI accepted requests for shell and root users (they are in the log)
+    if( ctx->from.uid != AID_SHELL && ctx->from.uid != AID_ROOT ) {
+        send_intent(ctx, ALLOW, ACTION_RESULT);
+    }
 
     arg0 = strrchr (ctx->to.shell, '/');
     arg0 = (arg0) ? arg0 + 1 : ctx->to.shell;
@@ -310,25 +409,8 @@ static void allow(const struct su_context *ctx)
         arg0 = p;
     }
 
-    /*
-     * Set effective uid back to root, otherwise setres[ug]id will fail
-     * if ctx->to.uid isn't root.
-     */
-    if (seteuid(0)) {
-        PLOGE("seteuid (root)");
-        exit(EXIT_FAILURE);
-    }
-
     populate_environment(ctx);
-
-    if (setresgid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        PLOGE("setresgid (%u)", ctx->to.uid);
-        exit(EXIT_FAILURE);
-    }
-    if (setresuid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        PLOGE("setresuid (%u)", ctx->to.uid);
-        exit(EXIT_FAILURE);
-    }
+	set_identity(ctx->to.uid);
 
 #define PARG(arg)									\
     (ctx->to.optind + (arg) < ctx->to.argc) ? " " : "",					\
@@ -353,6 +435,66 @@ static void allow(const struct su_context *ctx)
     exit(EXIT_FAILURE);
 }
 
+/*
+ * CyanogenMod-specific behavior
+ *
+ * we can't simply use the property service, since we aren't launched from init
+ * and can't trust the location of the property workspace.
+ * Find the properties ourselves.
+ */
+int access_disabled(const struct su_initiator *from)
+{
+    char *data;
+    char build_type[PROPERTY_VALUE_MAX];
+    char debuggable[PROPERTY_VALUE_MAX], enabled[PROPERTY_VALUE_MAX];
+    size_t len;
+
+    data = read_file("/system/build.prop");
+    if (check_property(data, "ro.cm.version")) {
+        get_property(data, build_type, "ro.build.type", "");
+        free(data);
+
+        data = read_file("/default.prop");
+        get_property(data, debuggable, "ro.debuggable", "0");
+        free(data);
+        /* only allow su on debuggable builds */
+        if (strcmp("1", debuggable) != 0) {
+            LOGE("Root access is disabled on non-debug builds");
+            return 1;
+        }
+
+        data = read_file("/data/property/persist.sys.root_access");
+        if (data != NULL) {
+            len = strlen(data);
+            if (len >= PROPERTY_VALUE_MAX)
+                memcpy(enabled, "1", 2);
+            else
+                memcpy(enabled, data, len + 1);
+            free(data);
+        } else
+            memcpy(enabled, "1", 2);
+
+        /* enforce persist.sys.root_access on non-eng builds for apps */
+        if (strcmp("eng", build_type) != 0 &&
+                from->uid != AID_SHELL && from->uid != AID_ROOT &&
+                (atoi(enabled) & CM_ROOT_ACCESS_APPS_ONLY) != CM_ROOT_ACCESS_APPS_ONLY ) {
+            LOGE("Apps root access is disabled by system setting - "
+                 "enable it under settings -> developer options");
+            return 1;
+        }
+
+        /* disallow su in a shell if appropriate */
+        if (from->uid == AID_SHELL &&
+                (atoi(enabled) & CM_ROOT_ACCESS_ADB_ONLY) != CM_ROOT_ACCESS_ADB_ONLY ) {
+            LOGE("Shell root access is disabled by a system setting - "
+                 "enable it under settings -> developer options");
+            return 1;
+        }
+        
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     struct su_context ctx = {
@@ -372,11 +514,19 @@ int main(int argc, char *argv[])
             .argc = argc,
             .optind = 0,
         },
+        .user = {
+            .userid = 0,
+            .owner_mode = -1,
+            .data_path = REQUESTOR_DATA_PATH,
+            .store_path = REQUESTOR_STORED_PATH,
+            .store_default = REQUESTOR_STORED_DEFAULT,
+        },
+        .child = 0,
     };
     struct stat st;
-    int socket_serv_fd, fd;
+    int c, socket_serv_fd, fd;
     char buf[64], *result;
-    int c, dballow;
+    allow_t dballow;
     struct option long_opts[] = {
         { "command",			required_argument,	NULL, 'c' },
         { "help",			no_argument,		NULL, 'h' },
@@ -446,16 +596,31 @@ int main(int argc, char *argv[])
     }
     ctx.to.optind = optind;
 
+    su_ctx = &ctx;
     if (from_init(&ctx.from) < 0) {
         deny(&ctx);
     }
+    
+    read_options(&ctx);
+    user_init(&ctx);
+    
+    if (ctx.user.owner_mode == -1 && ctx.user.userid != 0)
+        deny(&ctx);
+
+    if (access_disabled(&ctx.from))
+        deny(&ctx);
 
     ctx.umask = umask(027);
 
+    /*
+     * set LD_LIBRARY_PATH if the linker has wiped out it due to we're suid.
+     * This occurs on Android 4.0+
+     */
+    setenv("LD_LIBRARY_PATH", "/vendor/lib:/system/lib", 0);
     if (ctx.from.uid == AID_ROOT || ctx.from.uid == AID_SHELL)
         allow(&ctx);
 
-    if (stat(REQUESTOR_DATA_PATH, &st) < 0) {
+    if (stat(ctx.user.data_path, &st) < 0) {
         PLOGE("stat");
         deny(&ctx);
     }
@@ -488,13 +653,13 @@ int main(int argc, char *argv[])
 
     dballow = database_check(&ctx);
     switch (dballow) {
-        case DB_DENY: deny(&ctx);
-        case DB_ALLOW: allow(&ctx);
-        case DB_INTERACTIVE: break;
-        default: deny(&ctx);
+        case INTERACTIVE: break;
+        case ALLOW: allow(&ctx);	/* never returns */
+        case DENY:
+        default: deny(&ctx);		/* never returns too */
     }
     
-    socket_serv_fd = socket_create_temp(socket_path, sizeof(socket_path));
+    socket_serv_fd = socket_create_temp(ctx.sock_path, sizeof(ctx.sock_path));
     if (socket_serv_fd < 0) {
         deny(&ctx);
     }
@@ -507,7 +672,7 @@ int main(int argc, char *argv[])
     signal(SIGABRT, cleanup_signal);
     atexit(cleanup);
 
-    if (send_intent(&ctx, socket_path, -1, ACTION_REQUEST) < 0) {
+    if (send_intent(&ctx, INTERACTIVE, ACTION_REQUEST) < 0) {
         deny(&ctx);
     }
 
@@ -524,7 +689,7 @@ int main(int argc, char *argv[])
 
     close(fd);
     close(socket_serv_fd);
-    socket_cleanup();
+    socket_cleanup(&ctx);
 
     result = buf;
 
@@ -542,7 +707,4 @@ int main(int argc, char *argv[])
         LOGE("unknown response from Superuser Requestor: %s", result);
         deny(&ctx);
     }
-
-    deny(&ctx);
-    return -1;
 }
